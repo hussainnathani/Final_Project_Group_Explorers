@@ -46,7 +46,7 @@ from transformers import (
 
 RANDOM_STATE = 42
 
-TEXT_COL = "lemma_text"
+TEXT_COL = "clean_text"
 LABEL_COL = "label"
 
 

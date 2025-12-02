@@ -23,7 +23,7 @@ from sklearn.metrics import (
 RANDOM_STATE = 42
 
 # We will use these columns from your Phase-1 output:
-TEXT_COL = "lemma_text"
+TEXT_COL = "clean_text"
 LABEL_COL = "label"
 
 
