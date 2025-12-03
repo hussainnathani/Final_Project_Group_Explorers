@@ -1,54 +1,57 @@
 #!/usr/bin/env python3
 
 
+# ======================= IMPORTS =====================================
 import os
-import argparse
 import pickle
+import argparse
+
 import numpy as np
 import pandas as pd
+
 import matplotlib.pyplot as plt
 import seaborn as sns
 
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import classification_report, accuracy_score, f1_score
-from sklearn.utils.class_weight import compute_class_weight
+from sklearn.preprocessing import LabelEncoder
 
-import tensorflow as tf
 from tensorflow.keras.preprocessing.text import Tokenizer
 from tensorflow.keras.preprocessing.sequence import pad_sequences
-from tensorflow.keras.utils import to_categorical
-from tensorflow.keras.models import Model
+from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import (
-    Input,
     Embedding,
     Bidirectional,
     LSTM,
     Dense,
     Dropout,
-    Layer,
+    GlobalMaxPool1D,
 )
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+from tensorflow.keras.utils import to_categorical
 
-# ======================= CONFIG =======================
-TEXT_COL = "clean_text"     # column with cleaned tweet text
+
+# ======================= CONFIG ======================================
+TEXT_COL = "clean_text"
 LABEL_COL = "label"
 
 MAX_VOCAB = 20000
-MAX_LEN = 40                # shorter – avoids too much padding for tweets
-EMBEDDING_DIM = 256         # capacity for semantics
+MAX_LEN = 50
+EMBEDDING_DIM = 128  # learned embeddings (no GloVe)
+
 RANDOM_STATE = 42
 
 
-# ======================= UTILS ========================
+# ======================= UTILS =======================================
 def ensure_dir(path: str):
-    os.makedirs(path, exist_ok=True)
+    if not os.path.exists(path):
+        os.makedirs(path, exist_ok=True)
 
 
 def save_confusion_matrix(y_true, y_pred, class_names, out_path, title="Confusion Matrix"):
     from sklearn.metrics import confusion_matrix
-    cm = confusion_matrix(y_true, y_pred)
 
+    cm = confusion_matrix(y_true, y_pred)
     plt.figure(figsize=(7, 6))
     sns.heatmap(
         cm,
@@ -64,76 +67,94 @@ def save_confusion_matrix(y_true, y_pred, class_names, out_path, title="Confusio
     plt.tight_layout()
     plt.savefig(out_path, dpi=200)
     plt.close()
-    print(f"[INFO] Saved confusion matrix -> {out_path}")
+    print(f"[INFO] Saved confusion matrix to {out_path}")
 
 
-# ======================= ATTENTION ====================
-class BahdanauAttention(Layer):
-    """
-    Bahdanau-style attention over time steps.
-    Input:  (batch, timesteps, features)
-    Output: (batch, features)
-    """
-    def __init__(self, units=64, **kwargs):
-        super().__init__(**kwargs)
-        self.W1 = Dense(units)
-        self.V = Dense(1)
+# ======================= DATA LOADING =================================
+def load_data(train_path: str, test_path: str):
+    print("[LOAD] Reading cleaned train & test...")
+    train_df = pd.read_csv(train_path)
+    test_df = pd.read_csv(test_path)
 
-    def call(self, values):
-        # values: (batch, timesteps, features)
-        score = self.V(tf.nn.tanh(self.W1(values)))  # (batch, timesteps, 1)
-        attention_weights = tf.nn.softmax(score, axis=1)  # (batch, timesteps, 1)
-        context_vector = attention_weights * values       # (batch, timesteps, features)
-        context_vector = tf.reduce_sum(context_vector, axis=1)  # (batch, features)
-        return context_vector
+    # Sanity checks
+    assert TEXT_COL in train_df.columns and LABEL_COL in train_df.columns, \
+        f"Expected columns {TEXT_COL}, {LABEL_COL} in train CSV"
+    assert TEXT_COL in test_df.columns and LABEL_COL in test_df.columns, \
+        f"Expected columns {TEXT_COL}, {LABEL_COL} in test CSV"
 
-
-# ======================= MAIN =========================
-def main():
-    parser = argparse.ArgumentParser(description="BiLSTM + Attention Training Script")
-    parser.add_argument("--train_csv", type=str, default="train_clean.csv")
-    parser.add_argument("--test_csv", type=str, default="test_clean.csv")
-    parser.add_argument("--output_dir", type=str, default="models/bilstm")
-    args = parser.parse_args()
-
-    ensure_dir(args.output_dir)
-
-    # ---------- 1. LOAD DATA ----------
-    print("[LOAD] reading CSVs...")
-    train_df = pd.read_csv(args.train_csv)
-    test_df = pd.read_csv(args.test_csv)
+    before_train = train_df.shape[0]
+    before_test = test_df.shape[0]
 
     train_df = train_df.dropna(subset=[TEXT_COL, LABEL_COL]).reset_index(drop=True)
     test_df = test_df.dropna(subset=[TEXT_COL, LABEL_COL]).reset_index(drop=True)
+
+    print(f"Dropped {before_train - len(train_df)} train rows with NaN text/label")
+    print(f"Dropped {before_test - len(test_df)} test rows with NaN text/label")
 
     print("Train shape:", train_df.shape)
     print("Test shape :", test_df.shape)
     print("Train label distribution:\n", train_df[LABEL_COL].value_counts())
 
-    # ---------- 2. LABEL ENCODING ----------
+    return train_df, test_df
+
+
+# ======================= MAIN ========================================
+def main():
+    parser = argparse.ArgumentParser(
+        description="BiLSTM model for sarcasm/irony/figurative detection (cleaned data)"
+    )
+    parser.add_argument(
+        "--train_csv",
+        type=str,
+        default="train_clean.csv",
+        help="Path to train_clean.csv",
+    )
+    parser.add_argument(
+        "--test_csv",
+        type=str,
+        default="test_clean.csv",
+        help="Path to test_clean.csv",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="models/bilstm",
+        help="Directory to save model, tokenizer, and plots",
+    )
+    args = parser.parse_args()
+
+    ensure_dir(args.output_dir)
+
+    # -------- 1. Load data --------
+    train_df, test_df = load_data(args.train_csv, args.test_csv)
+
+    # -------- 2. Encode labels with LabelEncoder (like LR baseline) --------
     le = LabelEncoder()
     y_all = le.fit_transform(train_df[LABEL_COL])
     y_test = le.transform(test_df[LABEL_COL])
 
+    # Save label encoder for later use
     with open(os.path.join(args.output_dir, "label_encoder.pkl"), "wb") as f:
         pickle.dump(le, f)
-    print("[INFO] Label classes:", list(le.classes_))
+    print("Label classes:", list(le.classes_))
 
-    # ---------- 3. TRAIN / VAL SPLIT ----------
-    X_train_text, X_val_text, y_train, y_val = train_test_split(
-        train_df[TEXT_COL].astype(str),
+    # Split train into train / validation
+    train_split, val_split, y_train, y_val = train_test_split(
+        train_df,
         y_all,
         test_size=0.15,
         random_state=RANDOM_STATE,
         stratify=y_all,
     )
 
-    X_test_text = test_df[TEXT_COL].astype(str)
+    X_train = train_split[TEXT_COL].astype(str)
+    X_val = val_split[TEXT_COL].astype(str)
+    X_test = test_df[TEXT_COL].astype(str)
 
-    # ---------- 4. TOKENIZER ----------
+    # -------- 3. Tokenizer & sequences --------
     print("[STEP] Fitting tokenizer on training text...")
     tokenizer = Tokenizer(num_words=MAX_VOCAB, oov_token="<OOV>")
-    tokenizer.fit_on_texts(X_train_text)
+    tokenizer.fit_on_texts(X_train)
 
     def encode(texts):
         return pad_sequences(
@@ -143,86 +164,53 @@ def main():
             truncating="post",
         )
 
-    X_train = encode(X_train_text)
-    X_val = encode(X_val_text)
-    X_test = encode(X_test_text)
+    X_train_seq = encode(X_train)
+    X_val_seq = encode(X_val)
+    X_test_seq = encode(X_test)
 
     num_classes = len(le.classes_)
     y_train_cat = to_categorical(y_train, num_classes)
     y_val_cat = to_categorical(y_val, num_classes)
     y_test_cat = to_categorical(y_test, num_classes)
 
-    # ---------- 5. CLASS WEIGHTS ----------
-    class_weights_arr = compute_class_weight(
-        class_weight="balanced",
-        classes=np.unique(y_all),
-        y=y_all,
+    # -------- 4. Build BiLSTM model --------
+    print("[STEP] Building BiLSTM model...")
+    model = Sequential(
+        [
+            Embedding(input_dim=MAX_VOCAB, output_dim=EMBEDDING_DIM, input_length=MAX_LEN),
+            Bidirectional(LSTM(128, return_sequences=True)),
+            GlobalMaxPool1D(),
+            Dropout(0.3),
+            Dense(64, activation="relu"),
+            Dropout(0.3),
+            Dense(num_classes, activation="softmax"),
+        ]
     )
-    class_weights = dict(enumerate(class_weights_arr))
 
-    # extra upweight figurative / sarcasm / irony
-    classes = list(le.classes_)
-    print("[INFO] Base class weights:", class_weights)
-    if "figurative" in classes:
-        fig_idx = classes.index("figurative")
-        class_weights[fig_idx] *= 3.0  # stronger boost
-    if "sarcasm" in classes:
-        sar_idx = classes.index("sarcasm")
-        class_weights[sar_idx] *= 1.8
-    if "irony" in classes:
-        ir_idx = classes.index("irony")
-        class_weights[ir_idx] *= 1.5
-
-    print("[INFO] Adjusted class weights:", class_weights)
-
-    # ---------- 6. BUILD BiLSTM + ATTENTION MODEL ----------
-    print("[STEP] Building BiLSTM + Attention model...")
-
-    inputs = Input(shape=(MAX_LEN,), name="input_ids")
-    x = Embedding(input_dim=MAX_VOCAB, output_dim=EMBEDDING_DIM, input_length=MAX_LEN)(inputs)
-
-    # Simpler BiLSTM stack to avoid overfitting
-    x = Bidirectional(LSTM(64, return_sequences=True))(x)
-    x = Dropout(0.3)(x)
-
-    # Bahdanau Attention
-    x = BahdanauAttention(64)(x)
-    x = Dropout(0.5)(x)
-
-    x = Dense(128, activation="relu")(x)
-    x = Dropout(0.4)(x)
-    outputs = Dense(num_classes, activation="softmax")(x)
-
-    model = Model(inputs=inputs, outputs=outputs)
-    model.compile(
-        loss="categorical_crossentropy",
-        optimizer="adam",
-        metrics=["accuracy"],
-    )
+    model.compile(loss="categorical_crossentropy", optimizer="adam", metrics=["accuracy"])
     model.summary()
 
-    # ---------- 7. TRAIN ----------
+    # -------- 5. Train model --------
     checkpoint_path = os.path.join(args.output_dir, "best_lstm_model.h5")
     callbacks = [
-        EarlyStopping(monitor="val_loss", patience=2, restore_best_weights=True),
+        EarlyStopping(monitor="val_loss", patience=3, restore_best_weights=True),
         ModelCheckpoint(checkpoint_path, monitor="val_loss", save_best_only=True),
     ]
 
-    print("[STEP] Training...")
+    print("[STEP] Training BiLSTM...")
     history = model.fit(
-        X_train,
+        X_train_seq,
         y_train_cat,
-        validation_data=(X_val, y_val_cat),
-        epochs=7,
+        validation_data=(X_val_seq, y_val_cat),
+        epochs=4,
         batch_size=32,
-        class_weight=class_weights,
         callbacks=callbacks,
         verbose=1,
     )
 
-    # ---------- 8. EVALUATE ----------
+    # -------- 6. Evaluate on validation & test --------
     print("\n[STEP] Evaluating on validation set...")
-    y_val_pred = np.argmax(model.predict(X_val), axis=1)
+    y_val_pred = np.argmax(model.predict(X_val_seq), axis=1)
     print("Val Accuracy:", accuracy_score(y_val, y_val_pred))
     print("Val Macro F1:", f1_score(y_val, y_val_pred, average="macro"))
     print("\nValidation Classification Report:")
@@ -233,11 +221,11 @@ def main():
         y_val_pred,
         class_names=le.classes_,
         out_path=os.path.join(args.output_dir, "confusion_val_lstm.png"),
-        title="BiLSTM+Attention Confusion Matrix (Val)",
+        title="BiLSTM Confusion Matrix (Validation)",
     )
 
     print("\n[STEP] Evaluating on TEST set...")
-    y_test_pred = np.argmax(model.predict(X_test), axis=1)
+    y_test_pred = np.argmax(model.predict(X_test_seq), axis=1)
     print("Test Accuracy:", accuracy_score(y_test, y_test_pred))
     print("Test Macro F1:", f1_score(y_test, y_test_pred, average="macro"))
     print("\nTest Classification Report:")
@@ -248,20 +236,20 @@ def main():
         y_test_pred,
         class_names=le.classes_,
         out_path=os.path.join(args.output_dir, "confusion_test_lstm.png"),
-        title="BiLSTM+Attention Confusion Matrix (Test)",
+        title="BiLSTM Confusion Matrix (Test)",
     )
 
-    # ---------- 9. SAVE FINAL MODEL & TOKENIZER ----------
-    final_model_path = os.path.join(args.output_dir, "final_lstm_model_02.h5")
+    # -------- 7. Save final model & tokenizer --------
+    final_model_path = os.path.join(args.output_dir, "final_lstm_model.h5")
     model.save(final_model_path)
-    print(f"[INFO] Saved final model -> {final_model_path}")
+    print(f"[INFO] Saved final BiLSTM model to {final_model_path}")
 
     tokenizer_path = os.path.join(args.output_dir, "tokenizer.pkl")
     with open(tokenizer_path, "wb") as f:
         pickle.dump(tokenizer, f)
-    print(f"[INFO] Saved tokenizer -> {tokenizer_path}")
+    print(f"[INFO] Saved tokenizer to {tokenizer_path}")
 
-    print("\n[DONE] BiLSTM + Attention training complete.")
+    print("\n[DONE] BiLSTM training + evaluation complete.")
 
 
 if __name__ == "__main__":
